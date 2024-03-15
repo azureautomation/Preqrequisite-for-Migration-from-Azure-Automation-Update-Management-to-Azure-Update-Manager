@@ -11,6 +11,7 @@
     5. Assign required roles to the user managed identity created.
 
     The executor of the script should have Microsoft.Authorization/roleAssignments/write action such as Role Based Access Control Administrator on the scopes on which access will be granted to user managed identity. 
+    The script will register the automation subscription, subscriptions to which machines belong and subscriptions in dynamic azure queries to Microsoft.Maintenance and hence executor of the script should have Contributor/Owner access to all those subscriptions.
 
     .PARAMETER AutomationAccountResourceId
         Mandatory
@@ -48,6 +49,7 @@ $SoftwareUpdateConfigurationApiVersion = "2023-11-01";
 $UserManagedIdentityApiVersion = "2023-01-31";
 $AzureRoleAssignmentApiVersion = "2022-04-01";
 $SolutionsApiVersion = "2015-11-01-preview"
+$RegisterResourceProviderApiVersion = "2022-12-01";
 
 # HTTP methods.
 $GET = "GET"
@@ -62,6 +64,7 @@ $SolutionsWithWorkspaceFilterPath = "/subscriptions/{0}/resourceGroups/{1}/provi
 $UserManagedIdentityPath = "subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{2}"
 $AzureRoleDefinitionPath = "/providers/Microsoft.Authorization/roleDefinitions/{0}"
 $AzureRoleAssignmentPath = "{0}/providers/Microsoft.Authorization/roleAssignments/{1}"
+$MaintenanceResourceProviderRegistrationPath = "/subscriptions/{0}/providers/Microsoft.Maintenance/register"
 
 # Role Definition IDs.
 $AzureConnectedMachineOnboardingRole = "b64e21ea-ac4e-4cdf-9dc9-5b892992bee7"
@@ -133,6 +136,7 @@ $Global:UserManagedIdentityResourceId = $null
 $Global:UserManagedIdentityPrincipalId = $null
 $Global:SoftwareUpdateConfigurationsResourceIDs = @{}
 $Global:AzureDynamicQueriesScope = @{}
+$Global:SubscriptionsToRegisterToMaintenanceResourceProvider = @{}
 
 function Write-Telemetry
 {
@@ -142,7 +146,7 @@ function Write-Telemetry
         Telemetry levels can be "Informational", "Warning", "Error" or "Verbose".
     
     .PARAMETER Message
-		Log message to be written.
+        Log message to be written.
     
     .PARAMETER Level
         Log level.
@@ -176,18 +180,18 @@ function Write-Telemetry
 function Parse-ArmId
 {
     <#
-		.SYNOPSIS
-			Parses ARM resource id.
-	
-		.DESCRIPTION
-			This function parses ARM id to return subscription, resource group, resource name, etc.
-	
-		.PARAMETER ResourceId
-			ARM resourceId of the machine.		
-	
-		.EXAMPLE
-			Parse-ArmId -ResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
+        .SYNOPSIS
+            Parses ARM resource id.
+    
+        .DESCRIPTION
+            This function parses ARM id to return subscription, resource group, resource name, etc.
+    
+        .PARAMETER ResourceId
+            ARM resourceId of the machine.      
+    
+        .EXAMPLE
+            Parse-ArmId -ResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
     param(
         [Parameter(Mandatory = $true, Position = 1)]
         [String]$ResourceId
@@ -205,45 +209,45 @@ function Parse-ArmId
 
 function Invoke-RetryWithOutput
 {
-	<#
-		.SYNOPSIS
-			Generic retry logic.
-	
-		.DESCRIPTION
-			This command will perform the action specified until the action generates no errors, unless the retry limit has been reached.
-	
-		.PARAMETER Command
-			Accepts an Action object.
-			You can create a script block by enclosing your script within curly braces.		
-	
-		.PARAMETER Retry
-			Number of retries to attempt.
-	
-		.PARAMETER Delay
-			The maximum delay (in seconds) between each attempt. The default is 5 seconds.
-	
-		.EXAMPLE
-			$cmd = { If ((Get-Date) -lt (Get-Date -Second 59)) { Get-Object foo } Else { Write-Host 'ok' } }
-			Invoke-RetryWithOutput -Command $cmd -Retry 61
-	#>
-	[CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[ScriptBlock]$Command,
-	
-		[Parameter(Mandatory = $false, Position = 2)]
-		[ValidateRange(0, [UInt32]::MaxValue)]
-		[UInt32]$Retry = 3,
-	
-		[Parameter(Mandatory = $false, Position = 3)]
-		[ValidateRange(0, [UInt32]::MaxValue)]
-		[UInt32]$Delay = 5
-	)
-	
+    <#
+        .SYNOPSIS
+            Generic retry logic.
+    
+        .DESCRIPTION
+            This command will perform the action specified until the action generates no errors, unless the retry limit has been reached.
+    
+        .PARAMETER Command
+            Accepts an Action object.
+            You can create a script block by enclosing your script within curly braces.     
+    
+        .PARAMETER Retry
+            Number of retries to attempt.
+    
+        .PARAMETER Delay
+            The maximum delay (in seconds) between each attempt. The default is 5 seconds.
+    
+        .EXAMPLE
+            $cmd = { If ((Get-Date) -lt (Get-Date -Second 59)) { Get-Object foo } Else { Write-Host 'ok' } }
+            Invoke-RetryWithOutput -Command $cmd -Retry 61
+    #>
+    [CmdletBinding()]
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [ScriptBlock]$Command,
+    
+        [Parameter(Mandatory = $false, Position = 2)]
+        [ValidateRange(0, [UInt32]::MaxValue)]
+        [UInt32]$Retry = 3,
+    
+        [Parameter(Mandatory = $false, Position = 3)]
+        [ValidateRange(0, [UInt32]::MaxValue)]
+        [UInt32]$Delay = 5
+    )
+    
     $ErrorActionPreferenceToRestore = $ErrorActionPreference
     $ErrorActionPreference = "Stop"
-		
+        
     for ($i = 0; $i -lt $Retry; $i++) 
     {
         $exceptionMessage = ""
@@ -258,7 +262,7 @@ function Invoke-RetryWithOutput
         catch [Exception] 
         {
             $exceptionMessage = $_.Exception.Message
-				
+                
             if ($Global:Error.Count -gt 0) 
             {
                 $Global:Error.RemoveAt(0)
@@ -283,44 +287,44 @@ function Invoke-RetryWithOutput
 function Invoke-AzRestApiWithRetry
 {
    <#
-		.SYNOPSIS
-			Wrapper around Invoke-AzRestMethod.
-	
-		.DESCRIPTION
-			This function calls Invoke-AzRestMethod with retries.
-	
-		.PARAMETER Params
-			Parameters to the cmdlet.
+        .SYNOPSIS
+            Wrapper around Invoke-AzRestMethod.
+    
+        .DESCRIPTION
+            This function calls Invoke-AzRestMethod with retries.
+    
+        .PARAMETER Params
+            Parameters to the cmdlet.
 
         .PARAMETER Payload
-			Payload.
+            Payload.
 
-		.PARAMETER Retry
-			Number of retries to attempt.
-	
-		.PARAMETER Delay
-			The maximum delay (in seconds) between each attempt. The default is 5 seconds.
+        .PARAMETER Retry
+            Number of retries to attempt.
+    
+        .PARAMETER Delay
+            The maximum delay (in seconds) between each attempt. The default is 5 seconds.
             
-		.EXAMPLE
-			Invoke-AzRestApiWithRetry -Params @{SubscriptionId = "xxxx" ResourceGroup = "rgName" ResourceName = "resourceName" ResourceProvider = "Microsoft.Compute" ResourceType = "virtualMachines"} -Payload "{'location': 'westeurope'}"
-	#>
-	[CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[System.Collections.Hashtable]$Params,
+        .EXAMPLE
+            Invoke-AzRestApiWithRetry -Params @{SubscriptionId = "xxxx" ResourceGroup = "rgName" ResourceName = "resourceName" ResourceProvider = "Microsoft.Compute" ResourceType = "virtualMachines"} -Payload "{'location': 'westeurope'}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [System.Collections.Hashtable]$Params,
 
         [Parameter(Mandatory = $false, Position = 2)]
-		[Object]$Payload = $null,
+        [Object]$Payload = $null,
 
         [Parameter(Mandatory = $false, Position = 3)]
-		[ValidateRange(0, [UInt32]::MaxValue)]
-		[UInt32]$Retry = 3,
-	
-		[Parameter(Mandatory = $false, Position = 4)]
-		[ValidateRange(0, [UInt32]::MaxValue)]
-		[UInt32]$Delay = 5
-	)
+        [ValidateRange(0, [UInt32]::MaxValue)]
+        [UInt32]$Retry = 3,
+    
+        [Parameter(Mandatory = $false, Position = 4)]
+        [ValidateRange(0, [UInt32]::MaxValue)]
+        [UInt32]$Delay = 5
+    )
 
     if ($Payload)
     {
@@ -328,7 +332,7 @@ function Invoke-AzRestApiWithRetry
     }
 
     $retriableErrorCodes = @(429)
-		
+        
     for ($i = 0; $i -lt $Retry; $i++)
     {
         $exceptionMessage = ""
@@ -370,43 +374,43 @@ function Invoke-AzRestApiWithRetry
 function Invoke-ArmApi-WithPath
 {
    <#
-		.SYNOPSIS
-			The function prepares payload for Invoke-AzRestMethod
-	
-		.DESCRIPTION
-			This function prepares payload for Invoke-AzRestMethod.
-	
-		.PARAMETER Path
-			ARM API path.
+        .SYNOPSIS
+            The function prepares payload for Invoke-AzRestMethod
+    
+        .DESCRIPTION
+            This function prepares payload for Invoke-AzRestMethod.
+    
+        .PARAMETER Path
+            ARM API path.
 
         .PARAMETER ApiVersion
-			API version.
+            API version.
 
         .PARAMETER Method
-			HTTP method.
+            HTTP method.
 
         .PARAMETER Payload
-			Paylod for API call.
-	
-		.EXAMPLE
-			Invoke-ArmApi-WithPath -Path "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Compute/virtualMachines/{vmName}/start" -ApiVersion "2023-03-01" -method "PATCH" -Payload "{'location': 'westeurope'}"
-	#>
-	[CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[String]$Path,
+            Paylod for API call.
+    
+        .EXAMPLE
+            Invoke-ArmApi-WithPath -Path "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Compute/virtualMachines/{vmName}/start" -ApiVersion "2023-03-01" -method "PATCH" -Payload "{'location': 'westeurope'}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$Path,
 
         [Parameter(Mandatory = $true, Position = 2)]
-		[String]$ApiVersion,
+        [String]$ApiVersion,
 
         [Parameter(Mandatory = $true, Position = 3)]
         [ValidateScript({ $_ -in $HttpMethods })]
-		[String]$Method,
+        [String]$Method,
 
         [Parameter(Mandatory = $false, Position =4)]
-		[Object]$Payload = $null
-	)
+        [Object]$Payload = $null
+    )
 
     $PathWithVersion = "{0}?api-version={1}"
     if ($Path.Contains("?"))
@@ -426,21 +430,21 @@ function Invoke-ArmApi-WithPath
 function Process-ApiResponse
 {
     <#
-		.SYNOPSIS
-			Process API response and returns data.
-	
-		.PARAMETER Response
-			Response object.
-	
-		.EXAMPLE
-			Process-ApiResponse -Response {"StatusCode": 200, "Content": "{\"properties\": {\"location\": \"westeurope\"}}" }
-	#>
-	[CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[Object]$Response
-	)
+        .SYNOPSIS
+            Process API response and returns data.
+    
+        .PARAMETER Response
+            Response object.
+    
+        .EXAMPLE
+            Process-ApiResponse -Response {"StatusCode": 200, "Content": "{\"properties\": {\"location\": \"westeurope\"}}" }
+    #>
+    [CmdletBinding()]
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [Object]$Response
+    )
 
     $content = $null
     if ($Response.Content)
@@ -479,24 +483,24 @@ function Process-ApiResponse
 function Get-MachinesFromLogAnalytics
 {
    <#
-		.SYNOPSIS
-			Gets machines onboarded to updates solution from Log Analytics workspace.
-	
-		.DESCRIPTION
-			This command will return machines onboarded to UM from LA workspace.
+        .SYNOPSIS
+            Gets machines onboarded to updates solution from Log Analytics workspace.
+    
+        .DESCRIPTION
+            This command will return machines onboarded to UM from LA workspace.
 
         .PARAMETER ResourceId
-			Resource Id.
+            Resource Id.
 
-		.EXAMPLE
-			Get-MachinesFromLogAnalytics -ResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
-	[CmdletBinding()]
-	Param
-	(
+        .EXAMPLE
+            Get-MachinesFromLogAnalytics -ResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
         [Parameter(Mandatory = $true, Position = 1)]
-		[String]$ResourceId
-	)
+        [String]$ResourceId
+    )
     
     $armComponents = Parse-ArmId -ResourceId $ResourceId
     $script = {
@@ -513,24 +517,24 @@ function Get-MachinesFromLogAnalytics
 function Populate-AllMachinesOnboardedToUpdateManagement
 {
     <#
-		.SYNOPSIS
-			Gets all machines onboarded to Update Management under this automation account.
-	
-		.DESCRIPTION
-			This function gets all machines onboarded to Automation Update Management under this automation account using log analytics workspace.
-	
-		.PARAMETER AutomationAccountResourceId
-			Automation account resource id.
-	
-		.EXAMPLE
-			Populate-AllMachinesOnboardedToUpdateManagement -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
+        .SYNOPSIS
+            Gets all machines onboarded to Update Management under this automation account.
+    
+        .DESCRIPTION
+            This function gets all machines onboarded to Automation Update Management under this automation account using log analytics workspace.
+    
+        .PARAMETER AutomationAccountResourceId
+            Automation account resource id.
+    
+        .EXAMPLE
+            Populate-AllMachinesOnboardedToUpdateManagement -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
     [CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$AutomationAccountResourceId
+    )
 
     try 
     {
@@ -570,24 +574,24 @@ function Populate-AllMachinesOnboardedToUpdateManagement
 function Create-UserManagedIdentity
 {
     <#
-		.SYNOPSIS
-			Creates user managed Identity.
-	
-		.DESCRIPTION
-			This function will create user managed Identity in the same subscription and resource group as the automation account.
-	
-		.PARAMETER AutomationAccountResourceId
-			Automation account resource id.
-	
-		.EXAMPLE
-			Create-UserManagedIdentity -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
+        .SYNOPSIS
+            Creates user managed Identity.
+    
+        .DESCRIPTION
+            This function will create user managed Identity in the same subscription and resource group as the automation account.
+    
+        .PARAMETER AutomationAccountResourceId
+            Automation account resource id.
+    
+        .EXAMPLE
+            Create-UserManagedIdentity -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
     [CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$AutomationAccountResourceId
+    )
 
     try 
     {
@@ -621,27 +625,75 @@ function Create-UserManagedIdentity
     }
 }
 
+function Register-MaitenanceResourceProviderToSubscription
+{
+    <#
+        .SYNOPSIS
+            Register subscription with Microsoft.Maintenance Resource Provider.
+    
+        .DESCRIPTION
+            This function will register subscription with Microsoft.Maintenance Resource Provider.
+    
+        .PARAMETER ResourceId
+            Resource id.
+    
+        .EXAMPLE
+            Register-MaitenanceResourceProviderToSubscription ResourceId "{resId}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$ResourceId
+    )
+
+    try 
+    {    
+        # Register the subscription to which resource belongs to Microsoft.Maintenance.
+        $parts = $ResourceId.Split("/")
+        if (!$Global:SubscriptionsToRegisterToMaintenanceResourceProvider.ContainsKey($parts[2]))
+        {
+            $response = Invoke-ArmApi-WithPath -Path ($MaintenanceResourceProviderRegistrationPath -f $parts[2]) -ApiVersion $RegisterResourceProviderApiVersion -Method $POST
+
+            if ($null -eq $response.Response.id)
+            {
+                Write-Telemetry -Message ("Failed to register resource provider Microsoft.Maintenance with subscription {0} with error code {1} and error message {2}." -f $parts[2], $response.ErrorCode, $response.ErrorMessage) -Level $ErrorLvl
+            }
+            else 
+            {
+                Write-Telemetry -Message ("Successfully registered resource provider Microsoft.Maintenance with subscription {0}." -f $parts[2])
+                $Global:SubscriptionsToRegisterToMaintenanceResourceProvider[$parts[2]] = $true
+            }
+        }
+    }
+    catch [Exception]
+    {
+        Write-Telemetry -Message ("Unhandled Exception {0} while registering subscription {1} to Microsoft.Maintenance." -f $_.Exception.Message, $parts[2]) -Level $ErrorLvl
+        throw
+    }
+}
+
 function Add-UserManagedIdentityToAutomationAccount
 {
     <#
-		.SYNOPSIS
-			Adds user managed Identity to the automation account.
-	
-		.DESCRIPTION
-			This function will add user managed Identity to the automation account.
-	
-		.PARAMETER AutomationAccountResourceId
-			Automation account resource id.
-	
-		.EXAMPLE
-			Add-UserManagedIdentityToAutomationAccount -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
+        .SYNOPSIS
+            Adds user managed Identity to the automation account.
+    
+        .DESCRIPTION
+            This function will add user managed Identity to the automation account.
+    
+        .PARAMETER AutomationAccountResourceId
+            Automation account resource id.
+    
+        .EXAMPLE
+            Add-UserManagedIdentityToAutomationAccount -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
     [CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$AutomationAccountResourceId
+    )
 
     try
     {
@@ -700,24 +752,24 @@ function Add-UserManagedIdentityToAutomationAccount
 function Update-AzModules
 {
     <#
-		.SYNOPSIS
-			Updates Az Modules for the automation account.
-	
-		.DESCRIPTION
-			This function will update Az modules for the automation account. Ensure to update any runbooks in the automation account that are not compatible post this update.
-	
-		.PARAMETER AutomationAccountResourceId
-			Automation account resource id.
-	
-		.EXAMPLE
-			Update-AzModules -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
+        .SYNOPSIS
+            Updates Az Modules for the automation account.
+    
+        .DESCRIPTION
+            This function will update Az modules for the automation account. Ensure to update any runbooks in the automation account that are not compatible post this update.
+    
+        .PARAMETER AutomationAccountResourceId
+            Automation account resource id.
+    
+        .EXAMPLE
+            Update-AzModules -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
     [CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$AutomationAccountResourceId
+    )
     try 
     {
         $response = Invoke-ArmApi-WithPath -Path $AutomationAccountResourceId -ApiVersion $AutomationApiVersion -Method $PATCH -Payload $UpdateAzModulesPayload
@@ -740,30 +792,30 @@ function Update-AzModules
 function Assign-Roles
 {
    <#
-		.SYNOPSIS
-			Assigns role Assignment for the scope specified.
-	
-		.DESCRIPTION
-			This command will assign role Assignment for the scope specifie.
+        .SYNOPSIS
+            Assigns role Assignment for the scope specified.
+    
+        .DESCRIPTION
+            This command will assign role Assignment for the scope specifie.
 
         .PARAMETER RoleDefinitionId
-			Role Definition Id.
+            Role Definition Id.
         
         .PARAMETER Scope
-			Role Definition Id.
+            Role Definition Id.
 
-		.EXAMPLE
-			Assign-Roles -RoleDefinitionId RoleDefinitionId -Scope Scope
-	#>
-	[CmdletBinding()]
-	Param
-	(
+        .EXAMPLE
+            Assign-Roles -RoleDefinitionId RoleDefinitionId -Scope Scope
+    #>
+    [CmdletBinding()]
+    Param
+    (
         [Parameter(Mandatory = $true, Position = 1)]
-		[String]$RoleDefinitionId,
+        [String]$RoleDefinitionId,
 
         [Parameter(Mandatory = $true, Position = 1)]
-		[String]$Scope
-	)
+        [String]$Scope
+    )
 
     try 
     {
@@ -797,24 +849,24 @@ function Assign-Roles
 function Get-AllSoftwareUpdateConfigurations
 {
     <#
-		.SYNOPSIS
-			Gets all software update configurations.
-	
-		.DESCRIPTION
-			This function gets all software update configurations with support for pagination.
-	
-		.PARAMETER AutomationAccountResourceId
-			Automation account resource id.
+        .SYNOPSIS
+            Gets all software update configurations.
+    
+        .DESCRIPTION
+            This function gets all software update configurations with support for pagination.
+    
+        .PARAMETER AutomationAccountResourceId
+            Automation account resource id.
             
-		.EXAMPLE
-			Get-AllSoftwareUpdateConfigurations -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
+        .EXAMPLE
+            Get-AllSoftwareUpdateConfigurations -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
     [CmdletBinding()]
-	Param
-	(
-		[Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$AutomationAccountResourceId
+    )
     $output = $null
     $skip = 0
     do
@@ -842,24 +894,24 @@ function Get-AllSoftwareUpdateConfigurations
 function Add-RoleAssignmentsForAzureDynamicMachinesScope
 {
    <#
-		.SYNOPSIS
-			Adds required roles assignments for azure dynamic machines scope.
-	
-		.DESCRIPTION
-			This command will add required roles assignments for azure dynamic machines scope.
+        .SYNOPSIS
+            Adds required roles assignments for azure dynamic machines scope.
+    
+        .DESCRIPTION
+            This command will add required roles assignments for azure dynamic machines scope.
 
         .PARAMETER AutomationAccountResourceId
-			Automation Account Resource Id.
+            Automation Account Resource Id.
 
-		.EXAMPLE
-			Add-RoleAssignmentsForAzureDynamicMachinesScope -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
-	[CmdletBinding()]
-	Param
-	(
+        .EXAMPLE
+            Add-RoleAssignmentsForAzureDynamicMachinesScope -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
         [Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+        [String]$AutomationAccountResourceId
+    )
     Get-AllSoftwareUpdateConfigurations -AutomationAccountResourceId $AutomationAccountResourceId
      
     $softwareUpdateConfigurations = [System.Collections.ArrayList]@($Global:SoftwareUpdateConfigurationsResourceIDs.Keys)
@@ -884,6 +936,9 @@ function Add-RoleAssignmentsForAzureDynamicMachinesScope
                             if (!$Global:AzureDynamicQueriesScope.ContainsKey($scope))
                             {
                                 $scopeAtSubscriptionLevel = $scope.Split("/")
+                                
+                                # Register subscription in query with Microsoft.Maintenance Resource Provider.
+                                Register-MaitenanceResourceProviderToSubscription -ResourceId $scope
 
                                 # Virtual machine contributor access for the scope to run arg queries and set patch properties and config assignments
                                 Assign-Roles -RoleDefinitionId $VirtualMachineContributorRole -Scope $scope
@@ -913,19 +968,22 @@ function Add-RoleAssignmentsForAzureDynamicMachinesScope
 function Add-RoleAssignmentsForMachines
 {
    <#
-		.SYNOPSIS
-			Adds required roles assignments for automation account.
-	
-		.DESCRIPTION
-			This command will add required roles assignments for automation account.
+        .SYNOPSIS
+            Adds required roles assignments for automation account.
+    
+        .DESCRIPTION
+            This command will add required roles assignments for automation account.
 
-		.EXAMPLE
-			Add-RoleAssignmentsForMachines
-	#>
+        .EXAMPLE
+            Add-RoleAssignmentsForMachines
+    #>
     foreach($machine in $Global:Machines)
     {
         try 
         {
+            # Register subscription to which machine belongs with Microsoft.Maintenance Resource Provider.
+            Register-MaitenanceResourceProviderToSubscription -ResourceId $machine
+
             if ($machine -Match "microsoft.hybridcompute")
             {
                 # Arc machine contributor access for arc machines.
@@ -950,26 +1008,29 @@ function Add-RoleAssignmentsForMachines
 function Add-RoleAssignmentsForAutomationAccount
 {
    <#
-		.SYNOPSIS
-			Adds required roles assignments for automation account.
-	
-		.DESCRIPTION
-			This command will add required roles assignments for automation account.
+        .SYNOPSIS
+            Adds required roles assignments for automation account.
+    
+        .DESCRIPTION
+            This command will add required roles assignments for automation account.
 
         .PARAMETER AutomationAccountResourceId
-			Automation Account Resource Id.
+            Automation Account Resource Id.
 
-		.EXAMPLE
-			Add-RoleAssignmentsForAutomationAccount -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
-	[CmdletBinding()]
-	Param
-	(
+        .EXAMPLE
+            Add-RoleAssignmentsForAutomationAccount -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
         [Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+        [String]$AutomationAccountResourceId
+    )
 
     $parts = $AutomationAccountResourceId.Split("/")
+
+    # Register subscription to which automation account belongs with Microsoft.Maintenance Resource Provider.
+    Register-MaitenanceResourceProviderToSubscription -ResourceId $AutomationAccountResourceId
 
     # Virtual machine contributor access to the resource group to which automation account belongs.
     Assign-Roles -RoleDefinitionId $VirtualMachineContributorRole -Scope ("/subscriptions/{0}/resourceGroups/{1}" -f $parts[2], $parts[4])
@@ -987,24 +1048,24 @@ function Add-RoleAssignmentsForAutomationAccount
 function Add-RoleAssignmentsForLogAnalyticsWorkspaceAndSolution
 {
    <#
-		.SYNOPSIS
-			Adds required roles assignments for log analytics workspace and solution.
-	
-		.DESCRIPTION
-			This command will add required roles assignments for log analytics workspace and solution.
+        .SYNOPSIS
+            Adds required roles assignments for log analytics workspace and solution.
+    
+        .DESCRIPTION
+            This command will add required roles assignments for log analytics workspace and solution.
 
         .PARAMETER AutomationAccountResourceId
-			Automation Account Resource Id.
+            Automation Account Resource Id.
 
-		.EXAMPLE
-			Add-RoleAssignmentsForLogAnalyticsWorkspaceAndSolution -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
-	#>
-	[CmdletBinding()]
-	Param
-	(
+        .EXAMPLE
+            Add-RoleAssignmentsForLogAnalyticsWorkspaceAndSolution -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
         [Parameter(Mandatory = $true, Position = 1)]
-		[String]$AutomationAccountResourceId
-	)
+        [String]$AutomationAccountResourceId
+    )
 
     $response = Invoke-ArmApi-WithPath -Path ($LinkedWorkspacePath -f $AutomationAccountResourceId) -ApiVersion $AutomationApiVersion -Method $GET
 
