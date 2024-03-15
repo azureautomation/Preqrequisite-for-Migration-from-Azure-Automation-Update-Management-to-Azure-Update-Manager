@@ -11,6 +11,7 @@ This script will do the following:
 5. Assign required roles to the user managed identity created.
 
 The executor of the script should have Microsoft.Authorization/roleAssignments/write action such as Role Based Access Control Administrator on the scopes on which access will be granted to user managed identity. 
+The script will register the automation subscription, subscriptions to which machines belong and subscriptions in dynamic azure queries to Microsoft.Maintenance and hence executor of the script should have Contributor/Owner access to all those subscriptions.
 
 ### PARAMETER AutomationAccountResourceId
         Mandatory. Automation Account Resource Id.
