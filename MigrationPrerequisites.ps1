@@ -6,19 +6,26 @@
     This script will do the following:
     1. Retrieve all machines onboarded to Azure Automation Update Management under this automation account from linked log analytics workspace.
     2. Update the Az.Modules for the automation account.
-    3. Create user managed identity in the same subscription and resource group as the automation account.
-    4. Associate the user managed identity to the automation account.
-    5. Assign required roles to the user managed identity created.
+    3. Creates an automation variable with name AutomationAccountAzureEnvironment which will store the Azure Cloud Environment to which Automation Account belongs.
+    4. Create user managed identity in the same subscription and resource group as the automation account.
+    5. Associate the user managed identity to the automation account.
+    6. Assign required roles to the user managed identity created.
 
     The executor of the script should have Microsoft.Authorization/roleAssignments/write action such as Role Based Access Control Administrator on the scopes on which access will be granted to user managed identity. 
     The script will register the automation subscription, subscriptions to which machines belong and subscriptions in dynamic azure queries to Microsoft.Maintenance and hence executor of the script should have Contributor/Owner access to all those subscriptions.
+    The script will register the automation subscription to Microsoft.EventGrid and hence executor of the script should have Contributor/Owner access to the subscription.
 
     .PARAMETER AutomationAccountResourceId
         Mandatory
         Automation Account Resource Id.
-    
+
+    .PARAMETER AutomationAccountAzureEnvironment
+        Mandatory
+        Azure Cloud Environment to which Automation Account belongs.
+        Accepted values are AzureCloud, AzureUSGovernment, AzureChinaCloud.
+        
     .EXAMPLE
-        MigrationPrerequisites -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}"
+        MigrationPrerequisites -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}" -AutomationAccountAzureEnvironment "AzureCloud"
 
     .OUTPUTS
         The user managed identity with required role assignments.
@@ -26,7 +33,10 @@
 param(
 
     [Parameter(Mandatory = $true)]
-    [String]$AutomationAccountResourceId
+    [String]$AutomationAccountResourceId,
+
+    [Parameter(Mandatory = $true)]
+    [String]$AutomationAccountAzureEnvironment = "AzureCloud"
 )
 
 # Telemetry level.
@@ -50,6 +60,7 @@ $UserManagedIdentityApiVersion = "2023-01-31";
 $AzureRoleAssignmentApiVersion = "2022-04-01";
 $SolutionsApiVersion = "2015-11-01-preview"
 $RegisterResourceProviderApiVersion = "2022-12-01";
+$AutomationVariableApiVersion = "2023-11-01";
 
 # HTTP methods.
 $GET = "GET"
@@ -65,6 +76,8 @@ $UserManagedIdentityPath = "subscriptions/{0}/resourceGroups/{1}/providers/Micro
 $AzureRoleDefinitionPath = "/providers/Microsoft.Authorization/roleDefinitions/{0}"
 $AzureRoleAssignmentPath = "{0}/providers/Microsoft.Authorization/roleAssignments/{1}"
 $MaintenanceResourceProviderRegistrationPath = "/subscriptions/{0}/providers/Microsoft.Maintenance/register"
+$EventGridResourceProviderRegistrationPath = "/subscriptions/{0}/providers/Microsoft.EventGrid/register"
+$AutomationVariablePath = "{0}/variables/AutomationAccountAzureEnvironment"
 
 # Role Definition IDs.
 $AzureConnectedMachineOnboardingRole = "b64e21ea-ac4e-4cdf-9dc9-5b892992bee7"
@@ -127,6 +140,18 @@ $RoleAssignmentPayload = @"
     }
   }  
 "@
+
+$AutomationVariablePayload = @"
+{
+    "name": "",
+    "properties": {
+      "value": "",
+      "description": "Azure Cloud Environment for the Automation Account",
+      "isEncrypted": false
+    }
+}
+"@
+
 # End of Payloads.
 
 $MachinesOnboaredToAutomationUpdateManagementQuery = 'Heartbeat | where Solutions contains "updates" | distinct Computer, ResourceId, ResourceType, OSType'
@@ -545,7 +570,7 @@ function Populate-AllMachinesOnboardedToUpdateManagement
             Write-Telemetry -Message ("Zero machines retrieved from log analytics workspace. If machines were recently onboarded, please wait for few minutes for machines to start reporting to log analytics workspace") -Level $ErrorLvl
             throw
         }
-        elseif ($laResults.Results.Count -gt 0)
+        elseif ($laResults.Results.Count -gt 0 -or @($laResults.Results).Count -gt 0)
         {
             Write-Telemetry -Message ("Retrieved machines from log analytics workspace.")
 
@@ -621,6 +646,49 @@ function Create-UserManagedIdentity
     catch [Exception]
     {
         Write-Telemetry -Message ("Unhandled Exception {0}." -f $_.Exception.Message) -Level $ErrorLvl
+        throw
+    }
+}
+
+function Register-EventGridResourceProviderToSubscription
+{
+    <#
+        .SYNOPSIS
+            Register subscription with Microsoft.EventGrid Resource Provider.
+    
+        .DESCRIPTION
+            This function will register subscription with Microsoft.EventGrid Resource Provider.
+    
+        .PARAMETER ResourceId
+            Resource id.
+    
+        .EXAMPLE
+            Register-EventGridResourceProviderToSubscription ResourceId "{resId}"
+    #>
+    [CmdletBinding()]
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$ResourceId
+    )
+
+    try 
+    {    
+        # Register the subscription to which automation account belongs to Microsoft.EventGrid.
+        $parts = $ResourceId.Split("/")
+        $response = Invoke-ArmApi-WithPath -Path ($EventGridResourceProviderRegistrationPath -f $parts[2]) -ApiVersion $RegisterResourceProviderApiVersion -Method $POST
+        if ($null -eq $response.Response.id)
+        {
+            Write-Telemetry -Message ("Failed to register resource provider Microsoft.EventGrid with subscription {0} with error code {1} and error message {2}." -f $parts[2], $response.ErrorCode, $response.ErrorMessage) -Level $ErrorLvl
+        }
+        else 
+        {
+            Write-Telemetry -Message ("Successfully registered resource provider Microsoft.EventGrid with subscription {0}." -f $parts[2])
+        }
+    }
+    catch [Exception]
+    {
+        Write-Telemetry -Message ("Unhandled Exception {0} while registering subscription {1} to Microsoft.EventGrid." -f $_.Exception.Message, $parts[2]) -Level $ErrorLvl
         throw
     }
 }
@@ -788,6 +856,57 @@ function Update-AzModules
         throw
     }
 }
+
+function Add-AutomationAccountAzureEnvironmentVariable
+{
+    <#
+        .SYNOPSIS
+            Adds azure environment variable for the automation account.
+    
+        .DESCRIPTION
+            This function will add azure environment variable for the automation account.
+    
+        .PARAMETER AutomationAccountResourceId
+            Automation account resource id.
+
+        .PARAMETER AutomationAccountAzureEnvironment
+            Azure Cloud to which automation account belongs to.
+            
+        .EXAMPLE
+            Add-AutomationAccountAzureEnvironmentVariable -AutomationAccountResourceId "/subscriptions/{subId}/resourceGroups/{rgName}/providers/Microsoft.Automation/automationAccounts/{aaName}" -AutomationAccountAzureEnvironment "AzureCloud"
+    #>
+    [CmdletBinding()]
+    Param
+    (
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]$AutomationAccountResourceId,
+
+        [Parameter(Mandatory = $true, Position = 2)]
+        [String]$AutomationAccountAzureEnvironment
+    )
+    try 
+    {
+        $payload = ConvertFrom-Json $AutomationVariablePayload
+        $payload.name = "AutomationAccountAzureEnvironment"
+        $payload.properties.value = """$AutomationAccountAzureEnvironment"""
+        $payload = ConvertTo-Json $payload -Depth $MaxDepth
+        $response = Invoke-ArmApi-WithPath -Path ($AutomationVariablePath -f $AutomationAccountResourceId) -ApiVersion $AutomationVariableApiVersion -Method $PUT -Payload $payload
+        if ($null -eq $response.Response.Id -and $response.Status -eq $Failed)
+        {
+            Write-Telemetry -Message ("Failed to add variable with error code {0} and error message {1}." -f $response.ErrorCode, $response.ErrorMessage) -Level $ErrorLvl
+        }
+        else
+        {
+            Write-Telemetry -Message ("Successfully added variable AutomationAccountAzureEnvironment to automation account.")
+        }
+    }
+    catch [Exception]
+    {
+        Write-Telemetry -Message ("Unhandled Exception {0}." -f $_.Exception.Message) -Level $ErrorLvl
+        throw
+    }
+}
+
 
 function Assign-Roles
 {
@@ -1102,7 +1221,7 @@ function Add-RoleAssignmentsForLogAnalyticsWorkspaceAndSolution
     }
 }
 
-$azConnect = Connect-AzAccount -UseDeviceAuthentication -SubscriptionId $AutomationAccountResourceId.Split("/")[2]
+$azConnect = Connect-AzAccount -UseDeviceAuthentication -SubscriptionId $AutomationAccountResourceId.Split("/")[2] -Environment $AutomationAccountAzureEnvironment
 if ($null -eq $azConnect)
 {
     Write-Telemetry -Message ("Failed to connect to azure.") -Level $ErrorLvl
@@ -1117,12 +1236,14 @@ try
 {
     Populate-AllMachinesOnboardedToUpdateManagement -AutomationAccountResourceId $AutomationAccountResourceId
     Update-AzModules -AutomationAccountResourceId $AutomationAccountResourceId
+    Add-AutomationAccountAzureEnvironmentVariable -AutomationAccountResourceId $AutomationAccountResourceId -AutomationAccountAzureEnvironment $AutomationAccountAzureEnvironment
     Create-UserManagedIdentity -AutomationAccountResourceId $AutomationAccountResourceId
     Add-UserManagedIdentityToAutomationAccount -AutomationAccountResourceId $AutomationAccountResourceId
     Add-RoleAssignmentsForAutomationAccount -AutomationAccountResourceId $AutomationAccountResourceId
     Add-RoleAssignmentsForLogAnalyticsWorkspaceAndSolution -AutomationAccountResourceId $AutomationAccountResourceId
     Add-RoleAssignmentsForMachines
     Add-RoleAssignmentsForAzureDynamicMachinesScope -AutomationAccountResourceId $AutomationAccountResourceId
+    Register-EventGridResourceProviderToSubscription -ResourceId $AutomationAccountResourceId
 
     Write-Output ("User Managed identity {0} successfully created, linked and assigned required roles for migration of automation account {1}." -f $Global:UserManagedIdentityResourceId, $AutomationAccountResourceId)
 }
