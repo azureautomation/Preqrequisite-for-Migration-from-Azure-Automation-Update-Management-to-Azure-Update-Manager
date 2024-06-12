@@ -1221,7 +1221,7 @@ function Add-RoleAssignmentsForLogAnalyticsWorkspaceAndSolution
     }
 }
 
-$azConnect = Connect-AzAccount -UseDeviceAuthentication -SubscriptionId $AutomationAccountResourceId.Split("/")[2] -Environment $AutomationAccountAzureEnvironment
+$azConnect = Connect-AzAccount -SubscriptionId $AutomationAccountResourceId.Split("/")[2] -Environment $AutomationAccountAzureEnvironment
 if ($null -eq $azConnect)
 {
     Write-Telemetry -Message ("Failed to connect to azure.") -Level $ErrorLvl
