@@ -1107,8 +1107,12 @@ function Add-RoleAssignmentsForLogAnalyticsWorkspaceAndSolution {
 
 $azConnect = Connect-AzAccount -SubscriptionId $AutomationAccountResourceId.Split("/")[2] -Environment $AutomationAccountAzureEnvironment
 if ($null -eq $azConnect) {
-    Write-Telemetry -Message ("Failed to connect to azure.") -Level $ErrorLvl
-    throw
+    Write-Telemetry -Message ("Failed to connect to azure in first attempt. Will retry with DeviceCodeAuthentication.") -Level $ErrorLvl
+    $azConnect = Connect-AzAccount -UseDeviceAuthentication -SubscriptionId $AutomationAccountResourceId.Split("/")[2] -Environment $AutomationAccountAzureEnvironment
+    if ($null -eq $azConnect) {
+        Write-Telemetry -Message ("Failed to connect to azure with DeviceCodeAuthentication also.") -Level $ErrorLvl
+        throw
+    }
 }
 else {
     Write-Telemetry -Message ("Successfully connected with account {0} to subscription {1}" -f $azConnect.Context.Account, $azConnect.Context.Subscription)
